@@ -66,7 +66,7 @@ if __name__ == "__main__":
     
     rows = []
     
-    for i in [1,2,5,10]:
+    for i in [30,40,50,55,60]:
         results, batch_wall = asyncio.run(run_concurrency(i, PROMPT, 200))
         rows.append(stats(i,results, batch_wall))
         time.sleep(2)

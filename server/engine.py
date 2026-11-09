@@ -1,33 +1,14 @@
 import asyncio
 from dataclasses import dataclass, field
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
-import mlx_lm
-from pydantic import BaseModel
 from mlx_lm import load
-import json
-import time
-from contextlib import asynccontextmanager
 from typing import Any
 from mlx_lm.models.cache import KVCache, make_prompt_cache
 import mlx.core as mx
 
 
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    task = asyncio.create_task(engine_loop())
-    yield
-    task.cancel()
-
-
-
-
-app = FastAPI(title='Qwen Inference Server', lifespan=lifespan)
+MAX_BATCH = 32 
 model, tokenizer = load('mlx-community/Qwen3-4B-Instruct-2507-4bit')
-
-MAX_BATCH = 64
 
 request_queue: asyncio.Queue = asyncio.Queue()
 
@@ -40,28 +21,11 @@ class Request:
     cache: Any = None
 
 
-class PromptRequest(BaseModel):
-    prompt: str
-    max_tokens: int = 200
 
 # Endpoint Async
 
-@app.post("/generate/stream")
-async def stream_endpoint(req: PromptRequest):
-    async def event_generator():
-        messages = [{"role": "user", "content": req.prompt}]
-        prompt_tokens = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
-        request = Request(prompt_tokens=prompt_tokens, max_tokens=req.max_tokens)
-        await request_queue.put(request)
-        while True:
-            item = await request.out_queue.get()
-            yield f"data:{json.dumps(item)}\n\n"
-            if item['type'] == "done":
-                break
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-
 # THE CONTINUOUS BATCHING ENGINE!.
+mx.set_cache_limit(1 * 1024**3)
 async def engine_loop():
     active = [] # requests curently in the batch
     batch_cache = None # One Batched Cache, persists across iterations
@@ -83,7 +47,7 @@ async def engine_loop():
         # Each arrival gets its own cache
         # Runs irs entire prompt and generates the firs token.
         # The only place where req.cache is used.
-
+        
         for req in new_requests:
             req.cache = make_prompt_cache(model)
             input_ids = mx.array([req.prompt_tokens])
@@ -110,6 +74,8 @@ async def engine_loop():
                 for layer, new_layer in zip(batch_cache,new_cache):
                     layer.extend(new_layer)
             active.extend(new_requests)
+        
+        req.cache = None
         
         # ---------------------------------------------------------------
         # 4. DECODE -> One Forward Pass for the whole batch
@@ -140,11 +106,13 @@ async def engine_loop():
             hit_eos = req.generated and req.generated[-1] in tokenizer.eos_token_ids
             hit_limit = len(req.generated) >= req.max_tokens
             if hit_eos or hit_limit:
+                print(mx.get_active_memory()/ 1e9, mx.get_cache_memory()/1e9, mx.get_peak_memory()/1e9)
                 req.out_queue.put_nowait({
                     "type":"done",
                     "generation_tokens": len(req.generated),
                     "finish_reason": "stop" if hit_eos else "length"
                 })
+
             else:
                 still_active.append(req)
                 survivors.append(i)
@@ -153,10 +121,14 @@ async def engine_loop():
             if active:
                 for layer in batch_cache:
                     layer.filter(survivors)
-            else:
+            else:   
                 batch_cache = None
 
         await asyncio.sleep(0)
+
+
+
+
 
 
 # THE ENGINE

@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+.env
+
+# Local / runtime data
+data/*.db
+.DS_Store
